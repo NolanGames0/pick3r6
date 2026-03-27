@@ -1,51 +1,79 @@
-import streamlit as st
-
-#!/usr/bin/env python3
 """
-Ottoneu Six Picks Optimizer
-============================
-Scrapes player prices directly from the Ottoneu Six Picks "Big Board" page:
-  https://ottoneu.fangraphs.com/sixpicks/baseball/board
+Ottoneu Six Picks Optimizer — Streamlit Edition
+================================================
+Mobile-friendly web app. Run locally or deploy free to Streamlit Community Cloud.
 
-This page is server-rendered HTML — no JavaScript, no login required.
-Prices, pick%, and yesterday's PTS are all in a plain <table>.
+LOCAL:
+  pip install streamlit requests beautifulsoup4
+  streamlit run sixpicks_app.py
+  → opens in browser, works great on phone via your local IP
 
-Then combines with MLB Stats API confirmed lineups + season stats to rank
-the top 5 players at each slot and find the optimal $120 lineup.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SETUP (one-time):
-  pip install requests beautifulsoup4
-
-USAGE:
-  python3 sixpicks_optimizer.py
-
-  Run ~1 hour before first pitch for confirmed lineups.
-  The board URL always returns the latest data.
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DEPLOY (free, permanent URL on your phone):
+  1. Push this file to a public GitHub repo
+  2. Go to share.streamlit.io → "New app" → point at your repo
+  3. Done — bookmark the URL on your phone
 """
 
-import sys, re, time, itertools
+import re, time, itertools
 from datetime import date
 from difflib import SequenceMatcher
 
-missing = []
-try:    import requests
-except ImportError: missing.append("requests")
-try:    from bs4 import BeautifulSoup
-except ImportError: missing.append("beautifulsoup4")
-if missing:
-    print("Missing packages. Run:\n  pip install " + " ".join(missing))
-    sys.exit(1)
+import requests
+import streamlit as st
+from bs4 import BeautifulSoup
+
+# =============================================================================
+#  PAGE CONFIG  (must be first Streamlit call)
+# =============================================================================
+st.set_page_config(
+    page_title="Six Picks Optimizer",
+    page_icon="⚾",
+    layout="centered",
+    initial_sidebar_state="collapsed",
+)
+
+# Mobile-first CSS
+st.markdown("""
+<style>
+  /* Tighten up padding on mobile */
+  .block-container { padding: 1rem 1rem 2rem; max-width: 700px; }
+  /* Card-style metric boxes */
+  .player-card {
+    background: #1e2a3a;
+    border-radius: 10px;
+    padding: 10px 14px;
+    margin-bottom: 8px;
+    border-left: 4px solid #f0a500;
+  }
+  .player-card.top { border-left-color: #2ecc71; }
+  .player-card .rank { color: #888; font-size: 0.75rem; }
+  .player-card .pname { font-weight: 700; font-size: 1rem; }
+  .player-card .meta { color: #aaa; font-size: 0.8rem; margin-top: 2px; }
+  .player-card .pts { float: right; font-size: 1.1rem; font-weight: 700; color: #f0a500; }
+  .optimal-slot {
+    display: flex; justify-content: space-between; align-items: center;
+    background: #162032; border-radius: 8px;
+    padding: 8px 12px; margin-bottom: 6px;
+  }
+  .slot-label { color: #888; font-size: 0.75rem; width: 36px; }
+  .slot-name { font-weight: 600; flex: 1; padding: 0 8px; }
+  .slot-sal { color: #aaa; font-size: 0.85rem; }
+  .slot-pts { color: #2ecc71; font-weight: 700; font-size: 0.95rem; }
+  /* Hide Streamlit hamburger / footer on mobile */
+  #MainMenu, footer { visibility: hidden; }
+  /* Make expanders look nicer */
+  .streamlit-expanderHeader { font-weight: 600; font-size: 1rem; }
+</style>
+""", unsafe_allow_html=True)
 
 # =============================================================================
 #  CONFIG
 # =============================================================================
-TODAY        = date.today().strftime("%Y-%m-%d")
-SEASON       = date.today().year
-SALARY_CAP   = 120.0
-MLB_API      = "https://statsapi.mlb.com/api/v1"
-BOARD_URL    = "https://ottoneu.fangraphs.com/sixpicks/baseball/board"
+TODAY         = date.today().strftime("%Y-%m-%d")
+SEASON        = date.today().year
+SALARY_CAP    = 120.0
+MLB_API       = "https://statsapi.mlb.com/api/v1"
+BOARD_URL     = "https://ottoneu.fangraphs.com/sixpicks/baseball/board"
 
 DEFAULT_HITTER_PA = 4.0
 DEFAULT_SP_IP     = 5.5
@@ -63,7 +91,7 @@ HEADERS = {
 }
 
 # =============================================================================
-#  SCORING (FanGraphs Points / Six Picks rules)
+#  SCORING
 # =============================================================================
 H_1B=5.6; H_2B=7.5; H_3B=10.5; H_HR=14.0
 H_BB=3.0; H_HBP=3.0; H_SB=1.9; H_CS=-2.8; H_AB=-1.0
@@ -73,462 +101,484 @@ SP_MULT = 0.5
 
 SLOTS = ["C", "CI", "MI", "OF", "SP", "RP"]
 SLOT_LABELS = {
-    "C":  "CATCHER",
-    "CI": "CORNER INFIELD  (1B / 3B)",
-    "MI": "MIDDLE INFIELD  (2B / SS)",
-    "OF": "OUTFIELD",
-    "SP": "STARTING PITCHER  [pts × 0.5]",
-    "RP": "RELIEF PITCHER",
+    "C":  "Catcher",
+    "CI": "Corner IF (1B/3B)",
+    "MI": "Middle IF (2B/SS)",
+    "OF": "Outfield",
+    "SP": "Starting P",
+    "RP": "Relief P",
 }
+SLOT_ICONS = {"C":"🎯","CI":"💪","MI":"⚡","OF":"🏃","SP":"🔥","RP":"🔒"}
+
 POS_TO_SLOT = {
     "C":["C"], "1B":["CI"], "3B":["CI"],
     "2B":["MI"], "SS":["MI"],
     "LF":["OF"], "CF":["OF"], "RF":["OF"], "OF":["OF"],
 }
+
+# ── Your custom closer list ──────────────────────────────────────────────────
 KNOWN_CLOSERS = [
-    "Edwin Diaz","Felix Bautista","Ryan Helsley","Emmanuel Clase",
-    "Devin Williams","Josh Hader","Clay Holmes","Jhoan Duran",
-    "Andres Munoz","Pete Fairbanks","Alexis Diaz","Jordan Romano",
-    "Camilo Doval","Evan Phillips","Tanner Scott","Raisel Iglesias",
-    "Kenley Jansen","David Bednar","Mason Miller","Jeff Hoffman",
+    "Ryan Helsley", "Emmanuel Clase", "Jhoan Duran", "Mason Miller",
+    "Tanner Scott", "Josh Hader", "Felix Bautista", "Edwin Diaz",
+    "Clay Holmes", "Devin Williams", "Pete Fairbanks", "Jordan Romano",
+    "David Bednar", "Jeff Hoffman", "Alexis Diaz", "Andres Munoz",
+    "Camilo Doval", "Evan Phillips", "Raisel Iglesias", "Kenley Jansen",
 ]
 
 # =============================================================================
-#  STEP 1 — SCRAPE THE BIG BOARD
+#  DATA FETCHING  (all cached so re-renders don't re-fetch)
 # =============================================================================
-def fetch_board(debug: bool = False) -> list[dict]:
-    """
-    Scrape the Ottoneu Six Picks board (always returns latest data).
-    Returns a list of dicts: {name, price, pick_pct, board_pts}
-
-    Known structure:
-      <table class="tablesorter tablesorter-default tablesorterXXXX" role="grid">
-        <thead><tr><th>NAME</th><th>PRICE</th><th>PICK%</th><th>PTS</th></tr></thead>
-        <tbody aria-live="polite">
-          <tr role="row" class="odd|even">
-            <td><a href="...">Player Name</a></td>
-            <td align="center">$25.75</td>
-            <td align="center">47.83%</td>
-            <td align="center">19.8</td>
-          </tr>
-    """
-    url = "https://ottoneu.fangraphs.com/sixpicks/baseball/board"
-    print(f"  Fetching board: {url}")
+@st.cache_data(ttl=1800, show_spinner=False)   # cache 30 min
+def fetch_board() -> list[dict]:
     try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
+        r = requests.get(BOARD_URL, headers=HEADERS, timeout=15)
         r.raise_for_status()
-    except requests.RequestException as e:
-        print(f"  ✗ Could not fetch board: {e}")
+    except Exception as e:
+        st.error(f"Board fetch failed: {e}")
         return []
 
     soup = BeautifulSoup(r.text, "html.parser")
 
-    if debug:
-        all_tables = soup.find_all("table")
-        print(f"  [debug] {len(all_tables)} table(s) found on page")
-        for i, t in enumerate(all_tables):
-            ths = [th.get_text(strip=True) for th in t.find_all("th")]
-            tbody = t.find("tbody")
-            tr_count = len(tbody.find_all("tr")) if tbody else 0
-            print(f"  [debug] table[{i}] class={t.get('class')} headers={ths} rows={tr_count}")
-
-    # Strategy 1: class contains "tablesorter"
     table = None
     for t in soup.find_all("table"):
-        classes = " ".join(t.get("class", []))
-        if "tablesorter" in classes:
-            table = t
-            break
-
-    # Strategy 2: any table whose text contains "PRICE"
+        if "tablesorter" in " ".join(t.get("class", [])):
+            table = t; break
     if not table:
         for t in soup.find_all("table"):
             if "PRICE" in t.get_text()[:500].upper():
-                table = t
-                break
-
-    # Strategy 3: any table where row 1, col 1 looks like a dollar amount
+                table = t; break
     if not table:
         for t in soup.find_all("table"):
             tbody = t.find("tbody")
-            if not tbody:
-                continue
-            first_row = tbody.find("tr")
-            if not first_row:
-                continue
-            cells = first_row.find_all("td")
-            if len(cells) >= 2 and "$" in cells[1].get_text():
-                table = t
-                break
-
+            if tbody:
+                first = tbody.find("tr")
+                if first:
+                    cells = first.find_all("td")
+                    if len(cells) >= 2 and "$" in cells[1].get_text():
+                        table = t; break
     if not table:
-        print("  ✗ Could not find player table on board page.")
-        if not debug:
-            print("  Tip: re-run with fetch_board(debug=True) to diagnose.")
         return []
 
-    # Detect column positions — fall back to known positions if detection fails
     thead = table.find("thead")
-    col_names = []
-    if thead:
-        col_names = [th.get_text(strip=True).upper() for th in thead.find_all("th")]
-
-    if debug:
-        print(f"  [debug] col_names from thead: {col_names}")
+    col_names = [th.get_text(strip=True).upper() for th in thead.find_all("th")] if thead else []
 
     def col_idx(candidates, default):
         for c in candidates:
             for i, h in enumerate(col_names):
-                if c in h:
-                    return i
-        return default  # hard-coded fallback to known column positions
+                if c in h: return i
+        return default
 
-    name_col  = col_idx(["NAME", "PLAYER"],          default=0)
-    price_col = col_idx(["PRICE", "SALARY", "COST"], default=1)
-    pct_col   = col_idx(["PICK", "PCT"],              default=2)
-    pts_col   = col_idx(["PTS", "POINTS", "SCORE"],   default=3)
+    name_col  = col_idx(["NAME","PLAYER"], 0)
+    price_col = col_idx(["PRICE","SALARY","COST"], 1)
+    pct_col   = col_idx(["PICK","PCT"], 2)
+    pts_col   = col_idx(["PTS","POINTS","SCORE"], 3)
 
-    if debug:
-        print(f"  [debug] cols → name={name_col} price={price_col} pct={pct_col} pts={pts_col}")
-
-    tbody = table.find("tbody")
-    tr_list = tbody.find_all("tr") if tbody else table.find_all("tr")[1:]
-
-    def cell_float(cells, idx, strip_chars="$%,"):
-        if idx is None or idx >= len(cells):
-            return None
-        raw = cells[idx].get_text(strip=True)
-        for ch in strip_chars:
-            raw = raw.replace(ch, "")
-        try:
-            return float(raw.strip())
-        except ValueError:
-            return None
+    def cell_float(cells, idx):
+        if idx is None or idx >= len(cells): return None
+        raw = cells[idx].get_text(strip=True).replace("$","").replace("%","").replace(",","")
+        try: return float(raw.strip())
+        except ValueError: return None
 
     rows = []
-    for tr in tr_list:
+    tbody = table.find("tbody")
+    for tr in (tbody.find_all("tr") if tbody else table.find_all("tr")[1:]):
         cells = tr.find_all("td")
-        if len(cells) < 2:
-            continue
-
+        if len(cells) < 2: continue
         name_cell = cells[name_col] if name_col < len(cells) else cells[0]
         a_tag = name_cell.find("a")
         name = (a_tag or name_cell).get_text(strip=True)
-        if not name or name.upper() in ("NAME", "PLAYER", ""):
-            continue
-
-        price     = cell_float(cells, price_col)
-        pick_pct  = cell_float(cells, pct_col)
-        board_pts = cell_float(cells, pts_col)
-
-        if price is None or not (0.5 <= price <= 200):
-            if debug:
-                raw_cells = [c.get_text(strip=True) for c in cells]
-                print(f"  [debug] skipped '{name}': price={price} cells={raw_cells}")
-            continue
-
+        if not name or name.upper() in ("NAME","PLAYER",""): continue
+        price = cell_float(cells, price_col)
+        if price is None or not (0.5 <= price <= 200): continue
         rows.append({
             "name":      name,
             "price":     price,
-            "pick_pct":  pick_pct,
-            "board_pts": board_pts,
+            "pick_pct":  cell_float(cells, pct_col),
+            "board_pts": cell_float(cells, pts_col),
         })
-
-    print(f"  ✓ Parsed {len(rows)} players from the board.")
     return rows
 
-def board_to_salary_dict(board_rows: list[dict]) -> dict:
-    """Convert board rows to {lowercase_name: price} lookup."""
-    return {row["name"].strip().lower(): row["price"] for row in board_rows}
 
-
-# =============================================================================
-#  STEP 2 — MLB STATS API
-# =============================================================================
-def fetch_today_games():
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_today_games() -> list:
     url = (f"{MLB_API}/schedule?sportId=1&date={TODAY}"
            f"&hydrate=lineups,probablePitcher,team&gameType=R")
     try:
         r = requests.get(url, timeout=12); r.raise_for_status()
         return [g for d in r.json().get("dates",[]) for g in d.get("games",[])]
-    except Exception as e:
-        print(f"  [MLB API] {e}"); return []
+    except Exception:
+        return []
 
 
-def extract_players(games):
-    batters, starters, seen = [], [], set()
-    for game in games:
-        for side in ("away", "home"):
-            ti   = game.get("teams",{}).get(side,{})
-            abbr = ti.get("team",{}).get("abbreviation","?")
-            prob = ti.get("probablePitcher")
-            if prob and prob.get("id") not in seen:
-                seen.add(prob["id"])
-                starters.append({
-                    "mlb_id": prob["id"],
-                    "name":   prob.get("fullName","?"),
-                    "team":   abbr,
-                })
-        lineups = game.get("lineups",{})
-        for key, side in [("awayPlayers","away"),("homePlayers","home")]:
-            abbr = game.get("teams",{}).get(side,{}).get("team",{}).get("abbreviation","?")
-            for p in lineups.get(key,[]):
-                pid = p.get("id")
-                pos = p.get("primaryPosition",{}).get("abbreviation","")
-                if pid and pid not in seen and pos != "P":
-                    seen.add(pid)
-                    batters.append({
-                        "mlb_id":   pid,
-                        "name":     p.get("fullName","?"),
-                        "pos_code": pos,
-                        "team":     abbr,
-                    })
-    return batters, starters
+@st.cache_data(ttl=3600, show_spinner=False)
+def mlb_stats(mlb_id: int, group: str) -> dict:
+    for season in [SEASON, SEASON - 1]:
+        try:
+            url = f"{MLB_API}/people/{mlb_id}/stats?stats=season&season={season}&group={group}"
+            r = requests.get(url, timeout=8); r.raise_for_status()
+            splits = r.json().get("stats",[{}])[0].get("splits",[])
+            if splits:
+                stat = splits[0].get("stat", {})
+                if group == "hitting" and float(stat.get("plateAppearances",0) or 0) >= MIN_PA:
+                    return stat
+                if group == "pitching" and float(stat.get("inningsPitched",0) or 0) >= MIN_IP:
+                    return stat
+        except Exception:
+            pass
+    return {}
 
 
-def mlb_stats(mlb_id, group):
+@st.cache_data(ttl=86400, show_spinner=False)
+def mlb_player_info(name: str) -> dict:
     try:
-        url = f"{MLB_API}/people/{mlb_id}/stats?stats=season&season={SEASON}&group={group}"
-        r = requests.get(url, timeout=8); r.raise_for_status()
-        splits = r.json().get("stats",[{}])[0].get("splits",[])
-        return splits[0].get("stat",{}) if splits else {}
+        q = requests.utils.quote(name)
+        r = requests.get(f"{MLB_API}/people/search?names={q}&sportId=1", timeout=8)
+        r.raise_for_status()
+        people = r.json().get("people", [])
+        if not people: return {}
+        p = min(people, key=lambda x: abs(len(x.get("fullName","")) - len(name)))
+        return {
+            "mlb_id":   p["id"],
+            "pos_code": p.get("primaryPosition",{}).get("abbreviation",""),
+            "team":     p.get("currentTeam",{}).get("abbreviation","?"),
+        }
     except Exception:
         return {}
 
-
-def hitter_pts(stats):
+# =============================================================================
+#  SCORING HELPERS
+# =============================================================================
+def hitter_pts(stats: dict) -> float:
     pa = float(stats.get("plateAppearances",0) or 0)
     if pa < MIN_PA: return 0.0
-    ab = float(stats.get("atBats",0) or 0)
-    h  = float(stats.get("hits",0) or 0)
-    d  = float(stats.get("doubles",0) or 0)
-    t  = float(stats.get("triples",0) or 0)
-    hr = float(stats.get("homeRuns",0) or 0)
-    bb = float(stats.get("baseOnBalls",0) or 0)
-    hp = float(stats.get("hitByPitch",0) or 0)
-    sb = float(stats.get("stolenBases",0) or 0)
-    cs = float(stats.get("caughtStealing",0) or 0)
-    s  = max(0.0, h - d - t - hr)
-    ppa = ((s/pa)*H_1B + (d/pa)*H_2B + (t/pa)*H_3B + (hr/pa)*H_HR +
-           (bb/pa)*H_BB + (hp/pa)*H_HBP + (sb/pa)*H_SB +
-           (cs/pa)*H_CS + (ab/pa)*H_AB)
-    return round(ppa * DEFAULT_HITTER_PA, 2)
+    ab=float(stats.get("atBats",0) or 0); h=float(stats.get("hits",0) or 0)
+    d=float(stats.get("doubles",0) or 0); t=float(stats.get("triples",0) or 0)
+    hr=float(stats.get("homeRuns",0) or 0); bb=float(stats.get("baseOnBalls",0) or 0)
+    hp=float(stats.get("hitByPitch",0) or 0); sb=float(stats.get("stolenBases",0) or 0)
+    cs=float(stats.get("caughtStealing",0) or 0); s=max(0.0,h-d-t-hr)
+    ppa=((s/pa)*H_1B+(d/pa)*H_2B+(t/pa)*H_3B+(hr/pa)*H_HR+(bb/pa)*H_BB+
+         (hp/pa)*H_HBP+(sb/pa)*H_SB+(cs/pa)*H_CS+(ab/pa)*H_AB)
+    return round(ppa*DEFAULT_HITTER_PA, 2)
 
 
-def pitcher_pts(stats, is_sp, exp_ip):
-    ip = float(stats.get("inningsPitched",0) or 0)
+def pitcher_pts(stats: dict, is_sp: bool) -> float:
+    ip=float(stats.get("inningsPitched",0) or 0)
     if ip < MIN_IP: return 0.0
-    outs = max(ip * 3, 1)
-    g    = max(float(stats.get("gamesPlayed",1) or 1), 1)
-    k    = float(stats.get("strikeOuts",0) or 0)
-    bb   = float(stats.get("baseOnBalls",0) or 0)
-    hp   = float(stats.get("hitByPitch",0) or 0)
-    hr   = float(stats.get("homeRuns",0) or 0)
-    sv   = float(stats.get("saves",0) or 0)
-    hld  = float(stats.get("holds",0) or 0)
-    eo   = exp_ip * 3
-    pts  = (eo*P_OUT + (k/outs)*eo*P_K + (bb/outs)*eo*P_BB +
-            (hp/outs)*eo*P_HBP + (hr/outs)*eo*P_HR +
-            (sv/g)*P_SV + (hld/g)*P_HLD)
-    return round(pts * (SP_MULT if is_sp else 1.0), 2)
+    outs=max(ip*3,1); g=max(float(stats.get("gamesPlayed",1) or 1),1)
+    k=float(stats.get("strikeOuts",0) or 0); bb=float(stats.get("baseOnBalls",0) or 0)
+    hp=float(stats.get("hitByPitch",0) or 0); hr=float(stats.get("homeRuns",0) or 0)
+    sv=float(stats.get("saves",0) or 0); hld=float(stats.get("holds",0) or 0)
+    eo=DEFAULT_SP_IP*3
+    pts=(eo*P_OUT+(k/outs)*eo*P_K+(bb/outs)*eo*P_BB+(hp/outs)*eo*P_HBP+
+         (hr/outs)*eo*P_HR+(sv/g)*P_SV+(hld/g)*P_HLD)
+    return round(pts*(SP_MULT if is_sp else 1.0), 2)
 
 
-# =============================================================================
-#  SALARY LOOKUP (fuzzy name match)
-# =============================================================================
+def blend_pts(season_pts: float, board_pts: float | None, weight: float) -> float:
+    """
+    Blend season-rate projection with last game's actual board score.
+    weight = 0.0  → pure season projection
+    weight = 1.0  → pure board score
+    If board_pts is None, fall back to season projection entirely.
+    """
+    if board_pts is None or weight == 0.0:
+        return season_pts
+    return round((1 - weight) * season_pts + weight * board_pts, 2)
+
+
 def salary_lookup(name: str, sal_dict: dict) -> float | None:
     k = name.strip().lower()
     if k in sal_dict: return sal_dict[k]
-    # Strip common suffixes
-    k2 = re.sub(r"\s+(jr\.?|sr\.?|ii|iii|iv)$", "", k).strip()
+    k2 = re.sub(r"\s+(jr\.?|sr\.?|ii|iii|iv)$","",k).strip()
     if k2 in sal_dict: return sal_dict[k2]
-    # Fuzzy match
     best_r, best_v = 0.0, None
     for dk, dv in sal_dict.items():
         r = SequenceMatcher(None, k, dk).ratio()
         if r > best_r: best_r, best_v = r, dv
     return best_v if best_r >= 0.82 else None
 
+# =============================================================================
+#  BUILD POOL
+# =============================================================================
+def build_pool(board_rows: list[dict], perf_weight: float) -> list:
+    sal_dict = {r["name"].strip().lower(): r["price"] for r in board_rows}
+    board_pts_dict = {r["name"].strip().lower(): r["board_pts"] for r in board_rows}
 
-# =============================================================================
-#  BUILD PLAYER POOL
-# =============================================================================
-def build_pool(sal_dict: dict) -> list:
-    print(f"  Fetching today's schedule ({TODAY})...")
+    # Confirmed lineups + SPs
     games = fetch_today_games()
-    if not games:
-        print("  No games found today."); return []
-    print(f"  {len(games)} game(s) today.")
+    confirmed_batters, confirmed_sps = [], []
+    if games:
+        seen = set()
+        for game in games:
+            for side in ("away","home"):
+                ti   = game.get("teams",{}).get(side,{})
+                abbr = ti.get("team",{}).get("abbreviation","?")
+                prob = ti.get("probablePitcher")
+                if prob and prob.get("id") not in seen:
+                    seen.add(prob["id"])
+                    confirmed_sps.append({"mlb_id":prob["id"],
+                                          "name":prob.get("fullName","?"),"team":abbr})
+            lineups = game.get("lineups",{})
+            for key, side in [("awayPlayers","away"),("homePlayers","home")]:
+                abbr = game.get("teams",{}).get(side,{}).get("team",{}).get("abbreviation","?")
+                for p in lineups.get(key,[]):
+                    pid = p.get("id"); pos = p.get("primaryPosition",{}).get("abbreviation","")
+                    if pid and pid not in seen and pos != "P":
+                        seen.add(pid)
+                        confirmed_batters.append({"mlb_id":pid,"name":p.get("fullName","?"),
+                                                  "pos_code":pos,"team":abbr})
 
-    batters, starters = extract_players(games)
-    if not batters:
-        print("  ⚠ Lineups not yet posted — re-run ~1hr before first pitch.")
-    else:
-        print(f"  {len(batters)} confirmed batters | {len(starters)} probable starters")
+    confirmed_batter_map = {p["name"].lower(): p for p in confirmed_batters}
+    confirmed_sp_map     = {p["name"].lower(): p for p in confirmed_sps}
+    lineups_posted       = len(confirmed_batters) > 0
 
     pool = []
+    seen_names = set()
 
-    print("  Fetching batter stats...")
-    for i, p in enumerate(batters):
-        slots = POS_TO_SLOT.get(p["pos_code"], ["CI"])
-        stats = mlb_stats(p["mlb_id"], "hitting")
-        sal   = salary_lookup(p["name"], sal_dict)
-        pts   = hitter_pts(stats)
-        pool.append({
-            "name":   p["name"], "team": p["team"], "slots": slots,
-            "salary": sal or 8.0, "pts": pts,
-            "value":  round(pts / (sal or 8.0), 3), "sal_ok": sal is not None,
-        })
-        if i % 6 == 5: time.sleep(0.2)
+    for row in board_rows:
+        name  = row["name"]
+        price = row["price"]
+        key   = name.lower()
+        if key in seen_names: continue
+        seen_names.add(key)
+        bp = board_pts_dict.get(key)
 
-    print("  Fetching SP stats...")
-    for p in starters:
+        if key in confirmed_sp_map:
+            info  = confirmed_sp_map[key]
+            stats = mlb_stats(info["mlb_id"], "pitching")
+            sp    = pitcher_pts(stats, is_sp=True)
+            pts   = blend_pts(sp, bp, perf_weight)
+            pool.append({"name":name,"team":info["team"],"slots":["SP"],
+                         "salary":price,"pts":pts,"season_pts":sp,"board_pts":bp,
+                         "value":round(pts/price,3),"confirmed":True})
+            continue
+
+        if key in confirmed_batter_map and lineups_posted:
+            info  = confirmed_batter_map[key]
+            slots = POS_TO_SLOT.get(info["pos_code"],["CI"])
+            stats = mlb_stats(info["mlb_id"], "hitting")
+            sp    = hitter_pts(stats)
+            pts   = blend_pts(sp, bp, perf_weight)
+            pool.append({"name":name,"team":info["team"],"slots":slots,
+                         "salary":price,"pts":pts,"season_pts":sp,"board_pts":bp,
+                         "value":round(pts/price,3),"confirmed":True})
+            continue
+
+        # Not in confirmed lineup — look up via MLB search
+        info = mlb_player_info(name)
+        if not info: continue
+        pos_code = info.get("pos_code",""); mlb_id = info.get("mlb_id")
+        team     = info.get("team","?")
+
+        if pos_code in ("SP","RP","P"):
+            slots = ["SP"] if pos_code in ("SP","P") else ["RP"]
+            stats = mlb_stats(mlb_id, "pitching")
+            sp    = pitcher_pts(stats, is_sp=(slots==["SP"]))
+        else:
+            slots = POS_TO_SLOT.get(pos_code, ["CI"])
+            stats = mlb_stats(mlb_id, "hitting")
+            sp    = hitter_pts(stats)
+
+        pts = blend_pts(sp, bp, perf_weight)
+        pool.append({"name":name,"team":team,"slots":slots,
+                     "salary":price,"pts":pts,"season_pts":sp,"board_pts":bp,
+                     "value":round(pts/price,3),"confirmed":False})
+
+    # Add SPs not on board
+    for p in confirmed_sps:
+        if p["name"].lower() in seen_names: continue
+        sal   = salary_lookup(p["name"], sal_dict) or 10.0
         stats = mlb_stats(p["mlb_id"], "pitching")
-        sal   = salary_lookup(p["name"], sal_dict)
-        pts   = pitcher_pts(stats, is_sp=True, exp_ip=DEFAULT_SP_IP)
-        pool.append({
-            "name":   p["name"], "team": p["team"], "slots": ["SP"],
-            "salary": sal or 10.0, "pts": pts,
-            "value":  round(pts / (sal or 10.0), 3), "sal_ok": sal is not None,
-        })
-        time.sleep(0.15)
+        sp    = pitcher_pts(stats, is_sp=True)
+        bp    = board_pts_dict.get(p["name"].lower())
+        pts   = blend_pts(sp, bp, perf_weight)
+        pool.append({"name":p["name"],"team":p["team"],"slots":["SP"],
+                     "salary":sal,"pts":pts,"season_pts":sp,"board_pts":bp,
+                     "value":round(pts/sal,3),"confirmed":True})
+        seen_names.add(p["name"].lower())
 
-    # Relief pitchers — no daily confirmed source; use known closer list
-    existing = {p["name"].lower() for p in pool}
+    # Add closers
     for name in KNOWN_CLOSERS:
-        if name.lower() in existing: continue
+        if name.lower() in seen_names: continue
         sal = salary_lookup(name, sal_dict) or 9.0
-        pts = round(4.2 + (sal - 9.0) * 0.22, 2)
-        pool.append({
-            "name":   name, "team": "?", "slots": ["RP"],
-            "salary": sal, "pts": pts,
-            "value":  round(pts / sal, 3), "sal_ok": True,
-        })
+        sp  = round(4.2 + (sal - 9.0) * 0.22, 2)
+        bp  = board_pts_dict.get(name.lower())
+        pts = blend_pts(sp, bp, perf_weight)
+        pool.append({"name":name,"team":"?","slots":["RP"],
+                     "salary":sal,"pts":pts,"season_pts":sp,"board_pts":bp,
+                     "value":round(pts/sal,3),"confirmed":False})
 
     return pool
 
 
-# =============================================================================
-#  OPTIMIZER + DISPLAY
-# =============================================================================
-def top5(pool, slot):
-    return sorted([p for p in pool if slot in p["slots"]],
-                  key=lambda p: p["pts"], reverse=True)[:5]
-
-
-def best_lineup(pool, top_n=14):
+def best_lineup(pool: list) -> dict:
     pools = {s: sorted([p for p in pool if s in p["slots"]],
-                        key=lambda p: p["pts"], reverse=True)[:top_n]
+                        key=lambda p: p["pts"], reverse=True)[:14]
              for s in SLOTS}
-    best = {"pts": -999, "lineup": None, "salary": 0}
+    best = {"pts":-999,"lineup":None,"salary":0}
     for combo in itertools.product(*[pools[s] for s in SLOTS]):
         if len({p["name"] for p in combo}) < 6: continue
         sal = sum(p["salary"] for p in combo)
         if sal > SALARY_CAP: continue
         pts = sum(p["pts"] for p in combo)
-        if pts > best["pts"]:
-            best = {"pts": pts, "lineup": combo, "salary": sal}
+        if pts > best["pts"]: best = {"pts":pts,"lineup":combo,"salary":sal}
     return best
 
+# =============================================================================
+#  UI COMPONENTS
+# =============================================================================
+def player_card(rank: int, p: dict):
+    is_top = rank == 1
+    confirmed_badge = " ✅" if p.get("confirmed") else ""
+    bp_str = f"  ·  Last game: {p['board_pts']:+.1f}" if p.get("board_pts") is not None else ""
+    sal_flag = "" if p.get("sal_ok", True) else " *"
 
-W = 74
-def hr(c="="): print(c * W)
-def section(t): print(); hr(); print(f"  {t}"); hr()
-
-
-def show_top5(players):
-    print(f"\n  {'#':<3}  {'PLAYER':<28} {'TEAM':>4}  {'SALARY':>7}  {'PROJ PTS':>9}  {'PTS/$':>6}")
-    print(f"  {'─'*3}  {'─'*28}  {'─'*4}  {'─'*7}  {'─'*9}  {'─'*6}")
-    for i, p in enumerate(players, 1):
-        flag = " " if p["sal_ok"] else "*"
-        print(f"  {i:<3}  {p['name']:<28} {p['team']:>4}  ${p['salary']:>6.2f}{flag} {p['pts']:>9.1f}  {p['value']:>6.3f}")
-
-
-def show_optimal(best):
-    if not best["lineup"]:
-        print("\n  No valid lineup found under the $120 cap."); return
-    print(f"\n  {'SLOT':<5}  {'PLAYER':<28} {'TEAM':>4}  {'SALARY':>7}  {'PROJ PTS':>9}")
-    print(f"  {'─'*4}  {'─'*28}  {'─'*4}  {'─'*7}  {'─'*9}")
-    for slot, p in zip(SLOTS, best["lineup"]):
-        print(f"  {slot:<5}  {p['name']:<28} {p['team']:>4}  ${p['salary']:>6.2f}  {p['pts']:>9.1f}")
-    rem = SALARY_CAP - best["salary"]
-    print(f"\n  TOTAL  ${best['salary']:.2f}  ·  Proj pts: {best['pts']:.1f}  ·  Cap remaining: ${rem:.2f}")
+    st.markdown(f"""
+    <div class="player-card {'top' if is_top else ''}">
+      <span class="pts">{p['pts']:.1f} pts</span>
+      <div class="rank">#{rank}</div>
+      <div class="pname">{p['name']}{confirmed_badge}</div>
+      <div class="meta">{p['team']}  ·  ${p['salary']:.2f}{sal_flag}  ·  {p['value']:.3f} pts/$  {bp_str}</div>
+    </div>
+    """, unsafe_allow_html=True)
 
 
-def show_board_preview(board_rows: list[dict], n: int = 10):
-    """Show the top N players from the raw board by price, as a sanity check."""
-    section(f"BIG BOARD PREVIEW  (top {n} by price — full universe)")
-    top = sorted(board_rows, key=lambda r: r["price"], reverse=True)[:n]
-    print(f"\n  {'PLAYER':<28}  {'PRICE':>7}  {'PICK%':>7}  {'BOARD PTS':>9}")
-    print(f"  {'─'*28}  {'─'*7}  {'─'*7}  {'─'*9}")
-    for r in top:
-        pct  = f"{r['pick_pct']:.2f}%" if r["pick_pct"] is not None else "  —  "
-        bpts = f"{r['board_pts']:.1f}"  if r["board_pts"] is not None else "  —"
-        print(f"  {r['name']:<28}  ${r['price']:>6.2f}  {pct:>7}  {bpts:>9}")
-
+def optimal_card(slots, lineup):
+    total_sal = sum(p["salary"] for p in lineup)
+    total_pts = sum(p["pts"] for p in lineup)
+    rem = SALARY_CAP - total_sal
+    for slot, p in zip(slots, lineup):
+        st.markdown(f"""
+        <div class="optimal-slot">
+          <span class="slot-label">{slot}</span>
+          <span class="slot-name">{p['name']} <small style="color:#666">{p['team']}</small></span>
+          <span class="slot-sal">${p['salary']:.2f}</span>
+          <span class="slot-pts">{p['pts']:.1f}</span>
+        </div>""", unsafe_allow_html=True)
+    st.markdown(f"""
+    <div style="display:flex;justify-content:space-between;padding:8px 12px;
+                margin-top:4px;border-top:1px solid #2a3a4a;font-size:0.9rem">
+      <span>Total: <b>${total_sal:.2f}</b></span>
+      <span>Remaining: <b style="color:#aaa">${rem:.2f}</b></span>
+      <span>Proj pts: <b style="color:#2ecc71">{total_pts:.1f}</b></span>
+    </div>""", unsafe_allow_html=True)
 
 # =============================================================================
-#  MAIN
+#  MAIN APP
 # =============================================================================
 def main():
-    hr("█")
-    print("  OTTONEU SIX PICKS OPTIMIZER")
-    print(f"  {TODAY}  |  Cap: ${SALARY_CAP:.0f}  |  Slots: C · CI · MI · OF · SP · RP")
-    hr("█")
+    # ── Header ────────────────────────────────────────────────────────────────
+    st.markdown("## ⚾ Six Picks Optimizer")
+    st.caption(f"{TODAY}  ·  Cap: ${SALARY_CAP:.0f}  ·  C · CI · MI · OF · SP · RP")
 
-    # ── 1. Scrape Big Board for prices ────────────────────────────────────────
-    print(f"\n[1/3] Fetching prices from Six Picks Big Board...")
-    board_rows = fetch_board(debug=True)
+    # ── Controls ──────────────────────────────────────────────────────────────
+    with st.expander("⚙️ Settings", expanded=False):
+        perf_weight = st.slider(
+            "Recent performance weight",
+            min_value=0.0, max_value=1.0, value=0.25, step=0.05,
+            help=(
+                "Blends last game's actual score (board PTS) into the projection. "
+                "0 = pure season-rate stats, 1 = pure last game score, "
+                "0.25 = 75% season + 25% last game (recommended)"
+            ),
+        )
+        st.caption(f"Projection = {(1-perf_weight)*100:.0f}% season stats + {perf_weight*100:.0f}% last game")
+
+    refresh = st.button("🔄 Refresh Data", use_container_width=True)
+    if refresh:
+        st.cache_data.clear()
+
+    # ── Load data ─────────────────────────────────────────────────────────────
+    with st.spinner("Fetching Big Board prices..."):
+        board_rows = fetch_board()
 
     if not board_rows:
-        print(f"\n  ⚠ Today's board ({TODAY}) is empty — it may not be populated yet.")
-        print(f"  Ottoneu typically posts the board the morning of game day.")
-        print(f"  You can verify at: https://ottoneu.fangraphs.com/sixpicks/baseball/board")
-        ans = input("\n  Continue without prices (all marked *)? [y/N]: ").strip().lower()
-        if ans != "y": sys.exit(0)
-        sal_dict = {}
+        st.error("Could not load the Big Board. It may not be posted yet — check back later.")
+        st.markdown(f"[Open Big Board ↗]({BOARD_URL})")
+        return
+
+    # Board summary
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Board players", len(board_rows))
+    col2.metric("Date", TODAY)
+    col3.metric("Cap", f"${SALARY_CAP:.0f}")
+
+    with st.spinner("Loading lineup + stats data..."):
+        games  = fetch_today_games()
+        pool   = build_pool(board_rows, perf_weight)
+
+    lineups_posted = any(p.get("confirmed") for p in pool)
+    if not lineups_posted:
+        st.warning("⏳ Lineups not yet posted — showing board player projections. Re-run ~1hr before first pitch.")
     else:
-        sal_dict = board_to_salary_dict(board_rows)
-        show_board_preview(board_rows, n=10)
+        conf = sum(1 for p in pool if p.get("confirmed"))
+        st.success(f"✅ {conf} confirmed starters in today's pool ({len(games)} games)")
 
-    # ── 2. Build player pool from MLB API ─────────────────────────────────────
-    print(f"\n[2/3] Loading today's player pool from MLB Stats API...")
-    pool = build_pool(sal_dict)
-    if not pool:
-        print("  Nothing to show. Try again closer to first pitch."); return
+    st.divider()
 
-    # ── 3. Rankings ───────────────────────────────────────────────────────────
-    print(f"\n[3/3] Ranking {len(pool)} players...\n")
-
+    # ── Top 5 per slot ─────────────────────────────────────────────────────────
     for slot in SLOTS:
-        section(f"TOP 5 — {SLOT_LABELS[slot]}")
-        players = top5(pool, slot)
-        if players:
-            show_top5(players)
-        else:
-            print("  No confirmed players at this position today.")
+        icon  = SLOT_ICONS[slot]
+        label = SLOT_LABELS[slot]
+        top   = sorted([p for p in pool if slot in p["slots"]],
+                        key=lambda p: p["pts"], reverse=True)[:5]
 
-    section("OPTIMAL LINEUP  (highest projected pts ≤ $120 cap)")
-    print("  Searching..."); show_optimal(best_lineup(pool))
+        with st.expander(f"{icon} **{label}**", expanded=(slot in ("SP","OF","CI"))):
+            if not top:
+                st.caption("No players found for this slot today.")
+            else:
+                for i, p in enumerate(top, 1):
+                    player_card(i, p)
 
-    section("BEST VALUE PICK PER SLOT  (most pts per dollar)")
-    print(f"\n  {'SLOT':<5}  {'PLAYER':<28} {'TEAM':>4}  {'SALARY':>7}  {'PROJ PTS':>9}  {'PTS/$':>6}")
-    print(f"  {'─'*4}  {'─'*28}  {'─'*4}  {'─'*7}  {'─'*9}  {'─'*6}")
-    for slot in SLOTS:
+    st.divider()
+
+    # ── Optimal lineup ────────────────────────────────────────────────────────
+    st.markdown("### 🏆 Optimal Lineup")
+    with st.spinner("Calculating best lineup..."):
+        best = best_lineup(pool)
+
+    if best["lineup"]:
+        optimal_card(SLOTS, best["lineup"])
+    else:
+        st.warning("No valid lineup found under the $120 cap.")
+
+    st.divider()
+
+    # ── Best value per slot ───────────────────────────────────────────────────
+    st.markdown("### 💰 Best Value per Slot")
+    cols = st.columns(2)
+    for i, slot in enumerate(SLOTS):
         elig = [p for p in pool if slot in p["slots"]]
         if not elig: continue
         bv = max(elig, key=lambda p: p["value"])
-        print(f"  {slot:<5}  {bv['name']:<28} {bv['team']:>4}  ${bv['salary']:>6.2f}  {bv['pts']:>9.1f}   {bv['value']:>6.3f}")
+        with cols[i % 2]:
+            st.markdown(f"""
+            <div class="player-card">
+              <span class="pts">{bv['value']:.3f}</span>
+              <div class="rank">{SLOT_ICONS[slot]} {SLOT_LABELS[slot]}</div>
+              <div class="pname">{bv['name']}</div>
+              <div class="meta">${bv['salary']:.2f}  ·  {bv['pts']:.1f} pts</div>
+            </div>""", unsafe_allow_html=True)
 
-    print()
-    hr()
-    print("  * = salary not found on today's board; $8/$10 default used.")
-    print("  RP = known closer list (MLB API has no daily RP confirmation).")
-    print(f"  Prices: ottoneu.fangraphs.com/sixpicks/baseball/board")
-    print(f"  Stats:  MLB Stats API {SEASON} season rates × typical game volume.")
-    print("  Re-run ~1hr before first pitch for confirmed lineups.")
-    hr()
-    print()
+    st.divider()
+
+    # ── Big Board table ───────────────────────────────────────────────────────
+    with st.expander("📋 Full Big Board", expanded=False):
+        import pandas as pd
+        df = pd.DataFrame([{
+            "Player":    r["name"],
+            "Price":     f"${r['price']:.2f}",
+            "Pick%":     f"{r['pick_pct']:.1f}%" if r["pick_pct"] else "—",
+            "Last PTS":  r["board_pts"] if r["board_pts"] is not None else "—",
+        } for r in sorted(board_rows, key=lambda x: x["price"], reverse=True)])
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+    # ── Footer ────────────────────────────────────────────────────────────────
+    st.caption(
+        f"Prices: [ottoneu.fangraphs.com/sixpicks/baseball/board]({BOARD_URL})  ·  "
+        f"Stats: MLB API {SEASON} (fallback to {SEASON-1})  ·  "
+        f"* = price not on board, default used"
+    )
 
 
 if __name__ == "__main__":
