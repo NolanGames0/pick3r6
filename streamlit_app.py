@@ -94,11 +94,11 @@ POS_TO_SLOT = {
 }
 
 KNOWN_CLOSERS = [
-    "Ryan Helsley","Emmanuel Clase","Jhoan Duran","Mason Miller",
-    "Tanner Scott","Josh Hader","Felix Bautista","Edwin Diaz",
+    "Ryan Helsley","Jhoan Duran","Mason Miller",
+    "Tanner Scott","Felix Bautista","Edwin Diaz",
     "Clay Holmes","Devin Williams","Pete Fairbanks","Jordan Romano",
-    "David Bednar","Jeff Hoffman","Alexis Diaz","Andres Munoz",
-    "Camilo Doval","Evan Phillips","Raisel Iglesias","Kenley Jansen",
+    "David Bednar","Jeff Hoffman","Andres Munoz",
+    "Camilo Doval","Evan Phillips",
 ]
 
 # Park factors (FanGraphs 3-yr rolling avg, 1.00 = neutral)
