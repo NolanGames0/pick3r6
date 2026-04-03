@@ -242,6 +242,66 @@ def mlb_recent_stats(mlb_id: int, group: str, days: int=14) -> dict:
         pass
     return {}
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def mlb_home_away_stats(mlb_id: int, home: bool) -> dict:
+    """Batter home or away splits. Falls back to prior season."""
+    sit = "h" if home else "a"
+    for season in [SEASON, SEASON-1]:
+        try:
+            url = (f"{MLB_API}/people/{mlb_id}/stats"
+                   f"?stats=statSplits&season={season}&group=hitting"
+                   f"&gameType=R&sitCodes={sit}")
+            r = requests.get(url, timeout=8); r.raise_for_status()
+            splits = r.json().get("stats",[{}])[0].get("splits",[])
+            if splits:
+                stat = splits[0].get("stat",{})
+                if float(stat.get("plateAppearances",0) or 0) >= MIN_SPLIT_PA:
+                    return stat
+        except Exception:
+            pass
+    return {}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def mlb_pitcher_suppression(sp_mlb_id: int) -> float:
+    """
+    Compute a batter suppression factor (0.75–1.25) for an opposing SP.
+    Based on the SP's ERA relative to league average (~4.30).
+    An ace with ERA 2.50 → factor ~0.82 (batters score 18% less than average).
+    A poor SP with ERA 6.00 → factor ~1.18 (batters score 18% more).
+    Result is clamped to [0.75, 1.25] so one outlier doesn't dominate.
+    We blend season ERA with recent ERA for stability.
+    """
+    LEAGUE_AVG_ERA = 4.30
+    try:
+        s_st = mlb_season_stats(sp_mlb_id, "pitching")
+        r_st = mlb_recent_stats(sp_mlb_id, "pitching")
+
+        def era_from(st):
+            ip  = float(st.get("inningsPitched",0) or 0)
+            er  = float(st.get("earnedRuns",0) or 0)
+            if ip < 1: return None
+            return (er / ip) * 9
+
+        s_era = era_from(s_st)
+        r_era = era_from(r_st)
+
+        if s_era is None:
+            return 1.0
+        # Blend: 80% season, 20% recent (if available)
+        if r_era is not None:
+            era = 0.80 * s_era + 0.20 * r_era
+        else:
+            era = s_era
+
+        # Factor: league_avg / pitcher_era
+        # Good pitcher (low ERA) → factor < 1 → suppresses batters
+        factor = LEAGUE_AVG_ERA / max(era, 1.0)
+        return round(max(0.75, min(1.25, factor)), 3)
+    except Exception:
+        return 1.0
+
+
 # =============================================================================
 #  GAME CONTEXT  — the authoritative source for SP, park, and matchup data
 # =============================================================================
@@ -356,8 +416,9 @@ def _ppa(s: dict) -> float:
 
 
 def hitter_pts(season: dict, split: dict, recent: dict,
-               exp_pa: float, pf: float,
-               sw: float, rw: float) -> tuple[float, str]:
+               home_away: dict, exp_pa: float, pf: float,
+               sw: float, rw: float, haw: float,
+               opp_sup: float = 1.0) -> tuple[float, str]:
     """Projected pts for a hitter. Returns (pts, notes_string)."""
     if float(season.get("plateAppearances",0) or 0) < MIN_PA:
         return 0.0, "no data"
@@ -378,10 +439,22 @@ def hitter_pts(season: dict, split: dict, recent: dict,
         base = (1-rw)*base + rw*(_ppa(recent)*exp_pa)
         notes.append(f"L14({int(rec_pa)}PA)")
 
-    # 3. Park factor
+    # 3. Home/away split
+    ha_pa = float(home_away.get("plateAppearances",0) or 0)
+    if ha_pa >= MIN_SPLIT_PA and haw > 0:
+        base = (1-haw)*base + haw*(_ppa(home_away)*exp_pa)
+        notes.append(f"{'home' if ha_pa else 'away'}({int(ha_pa)}PA)")
+
+    # 4. Park factor
     base *= pf
     if abs(pf - 1.0) > 0.005:
         notes.append(f"park×{pf:.2f}")
+
+    # 5. Opposing pitcher suppression
+    if abs(opp_sup - 1.0) > 0.02:
+        base *= opp_sup
+        quality = "ace" if opp_sup < 0.90 else ("tough" if opp_sup < 0.97 else "weak")
+        notes.append(f"opp:{quality}(×{opp_sup:.2f})")
 
     return round(base, 2), (", ".join(notes) or "season")
 
@@ -440,6 +513,7 @@ def build_pool(board_rows: list[dict], ctx: dict, settings: dict) -> list[dict]:
 
     sal_dict   = {r["name"].strip().lower(): r["price"]      for r in board_rows}
     board_dict = {r["name"].strip().lower(): r["board_pts"]  for r in board_rows}
+    pickpct_dict = {r["name"].strip().lower(): (r["pick_pct"] or 0) for r in board_rows}
 
     starters         = ctx["starters"]     # CONFIRMED today's SPs from schedule
     batters          = ctx["batters"]      # confirmed lineup batters
@@ -488,6 +562,7 @@ def build_pool(board_rows: list[dict], ctx: dict, settings: dict) -> list[dict]:
             "badges":    f"{game_label} · 🤚{hand} · {notes}",
             "park":      park,
             "pf":        pf,
+            "pick_pct":  pickpct_dict.get(sp["name"].lower(), 0),
         })
 
     # ── BATTERS ───────────────────────────────────────────────────────────────
@@ -567,10 +642,17 @@ def build_pool(board_rows: list[dict], ctx: dict, settings: dict) -> list[dict]:
         exp_pa     = {1:LEADOFF_PA,2:LEADOFF_PA}.get(p.get("batting_order",5),
                       BOTTOM_PA if p.get("batting_order",5)>=7 else DEFAULT_PA)
 
-        s_st = mlb_season_stats(mlb_id, "hitting")
-        sp_st= mlb_split_stats(mlb_id, opp_hand) if opp_hand else {}
-        r_st = mlb_recent_stats(mlb_id, "hitting")
-        pts, notes = hitter_pts(s_st, sp_st, r_st, exp_pa, pf, sw, rw)
+        s_st  = mlb_season_stats(mlb_id, "hitting")
+        sp_st = mlb_split_stats(mlb_id, opp_hand) if opp_hand else {}
+        r_st  = mlb_recent_stats(mlb_id, "hitting")
+        # Home/away split: is this batter playing at home today?
+        is_home   = p.get("park") == p.get("team") or park_by_team.get(team,"") == team
+        ha_st     = mlb_home_away_stats(mlb_id, is_home)
+        # Opposing pitcher suppression factor
+        opp_sp    = next((s for s in starters if s.get("opp_team","") == team), None)
+        opp_sup   = mlb_pitcher_suppression(opp_sp["mlb_id"]) if opp_sp else 1.0
+        pts, notes = hitter_pts(s_st, sp_st, r_st, ha_st, exp_pa, pf, sw, rw,
+                                 haw=settings.get("ha_weight", 0.20), opp_sup=opp_sup)
         pts  = blend_board(pts, bp, bw)
 
         park_icon  = "🏔" if pf>1.02 else ("🏟" if pf<0.97 else "")
@@ -589,47 +671,91 @@ def build_pool(board_rows: list[dict], ctx: dict, settings: dict) -> list[dict]:
             "badges":    f"{game_label} {park_icon}{park} {hand_badge} {order_badge} · {notes}".strip(),
             "park":      park,
             "pf":        pf,
+            "pick_pct":  pickpct_dict.get(p["name"].lower(), 0),
         })
 
-    # ── RELIEF PITCHERS ───────────────────────────────────────────────────────
-    # Known closers list; use board price if available, else estimate
+    # ── RELIEF PITCHERS ─────────────────────────────────────────────────────
+    # Look up real stats for each known closer via MLB API.
     for name in KNOWN_CLOSERS:
         key = name.lower()
         if key in seen_names: continue
         sal = salary_lookup(name, sal_dict) or 9.0
         bp  = board_dict.get(key)
-        pts = round(4.2 + (sal - 9.0) * 0.22, 2)
+
+        # Try to find MLB ID via people search (cached)
+        try:
+            q = requests.utils.quote(name)
+            r_resp = requests.get(f"{MLB_API}/people/search?names={q}&sportId=1", timeout=6)
+            r_resp.raise_for_status()
+            people = r_resp.json().get("people",[])
+            if people:
+                px     = min(people, key=lambda x: abs(len(x.get("fullName",""))-len(name)))
+                rp_id  = px["id"]
+                rp_team= px.get("currentTeam",{}).get("abbreviation","?")
+                s_st   = mlb_season_stats(rp_id, "pitching")
+                r_st   = mlb_recent_stats(rp_id, "pitching")
+                pts, notes = pitcher_pts(s_st, r_st, is_sp=False, rw=rw)
+                if pts == 0.0:
+                    # Fall back to salary estimate if no stats
+                    pts = round(4.2 + (sal - 9.0) * 0.22, 2)
+                    notes = "closer est."
+            else:
+                rp_team = "?"
+                pts = round(4.2 + (sal - 9.0) * 0.22, 2)
+                notes = "closer est."
+        except Exception:
+            rp_team = "?"
+            pts = round(4.2 + (sal - 9.0) * 0.22, 2)
+            notes = "closer est."
+
         pts = blend_board(pts, bp, bw)
-        team      = ""
-        park      = park_by_team.get(team, "")
-        game_lbl  = ctx["game_label_by_team"].get(team,"")
         pool.append({
-            "name":p["name"] if False else name,
-            "team":      "?",
+            "name":      name,
+            "team":      rp_team,
             "slots":     ["RP"],
             "salary":    sal,
             "pts":       pts,
             "value":     round(pts/sal,3),
             "sal_ok":    True,
             "confirmed": False,
-            "badges":    "closer est.",
+            "badges":    notes,
             "park":      "",
         })
 
     return pool
 
 
-def best_lineup(pool: list) -> dict:
+def best_lineup(pool: list, mode: str = "max_pts",
+                contrarian_weight: float = 0.3) -> dict:
+    """
+    mode="max_pts"    → pure projected-pts optimisation (current behaviour)
+    mode="contrarian" → scores each lineup by pts * (1 / (1 + avg_ownership))
+                        so low-owned players get a relative bonus, helping
+                        you differentiate from the field.
+
+    contrarian_weight only used in contrarian mode:
+      0.0 = same as max_pts, 1.0 = pure ownership fade
+    """
+    def score(combo):
+        pts = sum(p["pts"] for p in combo)
+        if mode != "contrarian":
+            return pts
+        avg_own = sum(p.get("pick_pct", 50) for p in combo) / len(combo)
+        # ownership penalty: higher owned → lower score
+        return pts * (1.0 - contrarian_weight * (avg_own / 100.0))
+
     pools = {s: sorted([p for p in pool if s in p["slots"]],
                         key=lambda p: p["pts"], reverse=True)[:14]
              for s in SLOTS}
-    best = {"pts":-999,"lineup":None,"salary":0}
+    best = {"pts":-999,"lineup":None,"salary":0,"score":-999}
     for combo in itertools.product(*[pools[s] for s in SLOTS]):
         if len({p["name"] for p in combo}) < 6: continue
         sal = sum(p["salary"] for p in combo)
         if sal > SALARY_CAP: continue
-        pts = sum(p["pts"] for p in combo)
-        if pts > best["pts"]: best = {"pts":pts,"lineup":combo,"salary":sal}
+        sc = score(combo)
+        if sc > best["score"]:
+            best = {"pts":sum(p["pts"] for p in combo),
+                    "lineup":combo,"salary":sal,"score":sc}
     return best
 
 # =============================================================================
@@ -643,7 +769,7 @@ def player_card(rank: int, p: dict):
       <span class="pts">{p['pts']:.1f}</span>
       <div class="rank">#{rank}</div>
       <div class="pname">{p['name']}{conf}</div>
-      <div class="meta">{p['team']} · ${p['salary']:.2f} · {p['value']:.3f} pts/$
+      <div class="meta">{p['team']} · ${p['salary']:.2f} · {p['value']:.3f} pts/$ · {p.get('pick_pct',0):.0f}% owned
         {' · <b style="color:#c8a838">' + p['badges'] + '</b>' if p.get('badges') else ''}
       </div>
     </div>""", unsafe_allow_html=True)
@@ -688,8 +814,21 @@ def main():
             help="Weight given to last-14-day stats vs full-season rates.")
         bw = c3.slider("Last board score", 0.0, 1.0, 0.15, 0.05,
             help="How much yesterday's actual Six Picks score influences today's projection.")
-        st.caption(f"Season stats · {sw*100:.0f}% platoon split · {rw*100:.0f}% L14 · "
-                   f"{bw*100:.0f}% last board · park multiplier always on")
+        c4, c5 = st.columns(2)
+        haw = c4.slider("Home/away split", 0.0, 1.0, 0.20, 0.05,
+            help="Weight given to batter's home or away stats. "
+                 "Some players hit dramatically better at home.")
+        cw  = c5.slider("Contrarian weight", 0.0, 1.0, 0.0, 0.05,
+            help="In contrarian mode, penalises high-ownership picks. "
+                 "0 = ignore ownership, 1 = strongly prefer low-owned players. "
+                 "Use 0.2–0.4 to differentiate from the field.")
+        opt_mode = st.radio("Optimizer mode", ["Max pts", "Contrarian"],
+            horizontal=True,
+            help="Max pts: highest projected score. Contrarian: adjusts for ownership "
+                 "to find lineups others aren't picking.")
+        st.caption(f"Season stats · {sw*100:.0f}% platoon · {rw*100:.0f}% L14 · "
+                   f"{haw*100:.0f}% home/away · {bw*100:.0f}% last board · "
+                   f"opp quality + park always on")
 
     if st.button("🔄 Refresh all data", use_container_width=True):
         st.cache_data.clear()
@@ -747,7 +886,7 @@ def main():
 
     # ── Build pool ─────────────────────────────────────────────────────────────
     with st.spinner("Computing projections…"):
-        pool = build_pool(board_rows, ctx, {"split_weight":sw,"recent_weight":rw,"board_weight":bw})
+        pool = build_pool(board_rows, ctx, {"split_weight":sw,"recent_weight":rw,"board_weight":bw,"ha_weight":haw})
 
     if not pool:
         st.error("Could not build player pool."); return
@@ -769,7 +908,12 @@ def main():
     # ── Optimal lineup ─────────────────────────────────────────────────────────
     st.markdown("### 🏆 Optimal Lineup")
     with st.spinner("Optimizing…"):
-        best = best_lineup(pool)
+        best = best_lineup(pool,
+                           mode="contrarian" if opt_mode=="Contrarian" else "max_pts",
+                           contrarian_weight=cw)
+    if opt_mode == "Contrarian":
+        st.info(f"🎲 Contrarian mode: ownership weight {cw*100:.0f}% · "
+                f"lower-owned players receive a scoring bonus")
     optimal_card(best)
 
     st.divider()
