@@ -305,52 +305,138 @@ def mlb_pitcher_suppression(sp_mlb_id: int) -> float:
 # =============================================================================
 #  GAME CONTEXT  — the authoritative source for SP, park, and matchup data
 # =============================================================================
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_team_roster(team_abbr: str) -> list[dict]:
+    """
+    Get the active 26-man roster for a team, returning position players only.
+    Cached 1hr — rosters don't change mid-day.
+    """
+    try:
+        # First resolve abbr -> team ID
+        r = requests.get(f"{MLB_API}/teams?sportId=1&season={SEASON}", timeout=8)
+        r.raise_for_status()
+        team_id = None
+        for t in r.json().get("teams", []):
+            if t.get("abbreviation") == team_abbr:
+                team_id = t["id"]
+                break
+        if not team_id:
+            return []
+
+        r2 = requests.get(
+            f"{MLB_API}/teams/{team_id}/roster?rosterType=active&season={SEASON}",
+            timeout=10
+        )
+        r2.raise_for_status()
+        roster = r2.json().get("roster", [])
+
+        players = []
+        for entry in roster:
+            pos = entry.get("position", {}).get("abbreviation", "")
+            if pos in ("SP", "RP", "P", "TWP"):
+                continue
+            pid  = entry.get("person", {}).get("id")
+            name = entry.get("person", {}).get("fullName", "")
+            if pid and name:
+                players.append({"mlb_id": pid, "name": name, "pos_code": pos})
+        return players
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_estimated_lineup(team_abbr: str) -> list[dict]:
+    """
+    Build an estimated batting order for a team that hasn't posted their lineup.
+
+    Method:
+      1. Pull active roster, filter to position players
+      2. Fetch season plate appearances for each (prior year fallback)
+      3. Sort by PA desc — more PA = more likely a regular starter
+      4. Return top 9 as the estimated lineup
+
+    Batting order positions are assigned by PA rank (not real order), so all
+    players get DEFAULT_PA in projections — conservative but honest.
+    """
+    roster = fetch_team_roster(team_abbr)
+    if not roster:
+        return []
+
+    ranked = []
+    for p in roster:
+        stat = mlb_season_stats(p["mlb_id"], "hitting")
+        pa   = float(stat.get("plateAppearances", 0) or 0)
+        if pa < MIN_PA:
+            # Try prior season directly
+            try:
+                url = (f"{MLB_API}/people/{p['mlb_id']}/stats"
+                       f"?stats=season&season={SEASON-1}&group=hitting&gameType=R")
+                rv  = requests.get(url, timeout=6); rv.raise_for_status()
+                sp2 = rv.json().get("stats",[{}])[0].get("splits",[])
+                if sp2:
+                    pa = float(sp2[0].get("stat",{}).get("plateAppearances",0) or 0)
+            except Exception:
+                pass
+        ranked.append((pa, p))
+
+    ranked.sort(key=lambda x: x[0], reverse=True)
+
+    estimated = []
+    for i, (pa, p) in enumerate(ranked[:9], 1):
+        estimated.append({
+            "mlb_id":        p["mlb_id"],
+            "name":          p["name"],
+            "pos_code":      p["pos_code"],
+            "team":          team_abbr,
+            "batting_order": i,
+            "estimated":     True,
+        })
+    return estimated
+
+
 def build_game_context(games: list[dict]) -> dict:
     """
-    Walk today's schedule and build a rich context dict:
+    Walk today's schedule and build a rich context dict.
 
-      context["starters"]         → list of today's confirmed SP dicts
-      context["batters"]          → list of confirmed lineup batters
-      context["park_by_team"]     → {team_abbr: home_team_abbr}
-                                    e.g. "KCR" → "MIN"  (Ragans pitches AT MIN today)
-      context["opp_hand_by_team"] → {batting_team: opp_SP_pitchHand}
-      context["game_label_by_team"]→ {team_abbr: "@ MIN 1:10 PM"}  (display)
+    For each team in each game:
+      - If their lineup HAS been posted  -> use confirmed batters (confirmed=True)
+      - If their lineup has NOT been posted -> fetch_estimated_lineup() from
+        active roster ranked by PA           (estimated=True)
 
-    The park_by_team mapping mirrors exactly what the Six Picks "Game" column
-    shows: if a team is AWAY ("@MIN 1:10 PM") their park factor is MIN's,
-    not their own.
+    This means we always have a full slate of position players to project,
+    regardless of whether early games have posted and night games haven't.
     """
     starters, batters = [], []
-    park_by_team       = {}   # team → home team abbr (for park factor lookup)
-    opp_hand_by_team   = {}   # batting team → opposing SP hand
-    game_label_by_team = {}   # display string like "@ MIN 1:10 PM"
+    park_by_team       = {}
+    opp_hand_by_team   = {}
+    game_label_by_team = {}
+    lineup_status      = {}   # "confirmed" or "estimated" per team abbr
     seen               = set()
 
     for game in games:
-        home = game.get("teams",{}).get("home",{}).get("team",{})
-        away = game.get("teams",{}).get("away",{}).get("team",{})
+        home      = game.get("teams",{}).get("home",{}).get("team",{})
+        away      = game.get("teams",{}).get("away",{}).get("team",{})
         home_abbr = home.get("abbreviation","?")
         away_abbr = away.get("abbreviation","?")
 
-        # Game time (best-effort)
+        # Game time
         gt = game.get("gameDate","")
         try:
-            from datetime import datetime, timezone
+            from datetime import datetime, timezone, timedelta
             dt = datetime.fromisoformat(gt.replace("Z","+00:00"))
-            import pytz
-            eastern = pytz.timezone("US/Eastern")
+            # UTC-4 (EDT) / UTC-5 (EST) — use UTC-4 during baseball season (Apr-Oct)
+            eastern = timezone(timedelta(hours=-4))
             loc = dt.astimezone(eastern)
             time_str = loc.strftime("%-I:%M %p ET")
         except Exception:
             time_str = ""
 
-        # Both teams play in the home ballpark today
-        park_by_team[home_abbr] = home_abbr          # home team plays at home
-        park_by_team[away_abbr] = home_abbr           # AWAY team also plays at HOME park
-
+        park_by_team[home_abbr] = home_abbr
+        park_by_team[away_abbr] = home_abbr
         game_label_by_team[home_abbr] = f"vs {away_abbr} {time_str}".strip()
         game_label_by_team[away_abbr] = f"@ {home_abbr} {time_str}".strip()
 
+        # Probable starters
         for side in ("away","home"):
             ti   = game.get("teams",{}).get(side,{})
             abbr = ti.get("team",{}).get("abbreviation","?")
@@ -368,32 +454,54 @@ def build_game_context(games: list[dict]) -> dict:
                     "park":      park_by_team.get(abbr, abbr),
                     "game_label":game_label_by_team.get(abbr,""),
                 })
-                # The opposing batters face this pitcher
                 opp_hand_by_team[opp] = hand
 
-        # Confirmed lineup batters
-        lineups = game.get("lineups",{})
-        for key, side in [("awayPlayers","away"),("homePlayers","home")]:
-            abbr = game.get("teams",{}).get(side,{}).get("team",{}).get("abbreviation","?")
-            for order_idx, p in enumerate(lineups.get(key,[]), 1):
-                pid = p.get("id")
-                pos = p.get("primaryPosition",{}).get("abbreviation","")
-                if pid and pid not in seen and pos != "P":
-                    seen.add(pid)
+        # Lineups -- each side handled independently
+        lineups = game.get("lineups", {})
+        for lineup_key, abbr in [("awayPlayers", away_abbr), ("homePlayers", home_abbr)]:
+            posted = lineups.get(lineup_key, [])
+
+            if posted:
+                # Confirmed lineup
+                lineup_status[abbr] = "confirmed"
+                for order_idx, p in enumerate(posted, 1):
+                    pid = p.get("id")
+                    pos = p.get("primaryPosition",{}).get("abbreviation","")
+                    if pid and pid not in seen and pos != "P":
+                        seen.add(pid)
+                        batters.append({
+                            "mlb_id":       pid,
+                            "name":         p.get("fullName","?"),
+                            "pos_code":     pos,
+                            "team":         abbr,
+                            "batting_order":order_idx,
+                            "opp_hand":     opp_hand_by_team.get(abbr,""),
+                            "park":         park_by_team.get(abbr, abbr),
+                            "game_label":   game_label_by_team.get(abbr,""),
+                            "confirmed":    True,
+                            "estimated":    False,
+                        })
+            else:
+                # Estimated lineup from active roster
+                lineup_status[abbr] = "estimated"
+                est = fetch_estimated_lineup(abbr)
+                for p in est:
+                    if p["mlb_id"] in seen:
+                        continue
+                    seen.add(p["mlb_id"])
                     batters.append({
-                        "mlb_id":       pid,
-                        "name":         p.get("fullName","?"),
-                        "pos_code":     pos,
-                        "team":         abbr,
-                        "batting_order":order_idx,
-                        "opp_hand":     opp_hand_by_team.get(abbr,""),
-                        "park":         park_by_team.get(abbr, abbr),
-                        "game_label":   game_label_by_team.get(abbr,""),
+                        **p,
+                        "opp_hand":   opp_hand_by_team.get(abbr,""),
+                        "park":       park_by_team.get(abbr, abbr),
+                        "game_label": game_label_by_team.get(abbr,""),
+                        "confirmed":  False,
+                        "estimated":  True,
                     })
 
     return {
         "starters":          starters,
         "batters":           batters,
+        "lineup_status":     lineup_status,
         "park_by_team":      park_by_team,
         "opp_hand_by_team":  opp_hand_by_team,
         "game_label_by_team":game_label_by_team,
@@ -511,44 +619,34 @@ def build_pool(board_rows: list[dict], ctx: dict, settings: dict) -> list[dict]:
     rw = settings["recent_weight"]
     bw = settings["board_weight"]
 
-    sal_dict   = {r["name"].strip().lower(): r["price"]      for r in board_rows}
-    board_dict = {r["name"].strip().lower(): r["board_pts"]  for r in board_rows}
+    sal_dict     = {r["name"].strip().lower(): r["price"]     for r in board_rows}
+    board_dict   = {r["name"].strip().lower(): r["board_pts"] for r in board_rows}
     pickpct_dict = {r["name"].strip().lower(): (r["pick_pct"] or 0) for r in board_rows}
 
-    starters         = ctx["starters"]     # CONFIRMED today's SPs from schedule
-    batters          = ctx["batters"]      # confirmed lineup batters
+    starters         = ctx["starters"]
+    batters          = ctx["batters"]       # confirmed + estimated, merged by build_game_context
     park_by_team     = ctx["park_by_team"]
     opp_hand_by_team = ctx["opp_hand_by_team"]
-    lineups_posted   = len(batters) > 0
-
-    conf_batter_map = {p["name"].lower(): p for p in batters}
 
     pool       = []
     seen_names = set()
 
     # ── STARTING PITCHERS ────────────────────────────────────────────────────
-    # ONLY players confirmed as today's starters by the MLB schedule API.
-    # The board is used solely to look up their price.
+    # Only confirmed probable starters from the MLB schedule.
     for sp in starters:
-        key  = sp["name"].lower()
+        key    = sp["name"].lower()
         seen_names.add(key)
-        sal  = salary_lookup(sp["name"], sal_dict) or 10.0
+        sal    = salary_lookup(sp["name"], sal_dict) or 10.0
         sal_ok = salary_lookup(sp["name"], sal_dict) is not None
-        park = sp["park"]                          # home ballpark for THIS game
-        pf   = PARK_FACTORS.get(park, 1.0)         # park factor at today's venue
-        bp   = board_dict.get(key)
+        park   = sp["park"]
+        pf     = PARK_FACTORS.get(park, 1.0)
+        bp     = board_dict.get(key)
 
         s_st = mlb_season_stats(sp["mlb_id"], "pitching")
         r_st = mlb_recent_stats(sp["mlb_id"], "pitching")
         pts, notes = pitcher_pts(s_st, r_st, is_sp=True, rw=rw)
-
-        # SP park factor: a pitcher in a hitter's park gives up more runs → lower pts
-        pts = round(pts / pf, 2)  # inverse: hitter-friendly park hurts SP
+        pts = round(pts / pf, 2)   # hitter-friendly park hurts SP inversely
         pts = blend_board(pts, bp, bw)
-
-        opp  = sp.get("opp_team","")
-        hand = sp.get("hand","?")
-        game_label = sp.get("game_label","")
 
         pool.append({
             "name":      sp["name"],
@@ -559,105 +657,55 @@ def build_pool(board_rows: list[dict], ctx: dict, settings: dict) -> list[dict]:
             "value":     round(pts/sal, 3) if sal else 0,
             "sal_ok":    sal_ok,
             "confirmed": True,
-            "badges":    f"{game_label} · 🤚{hand} · {notes}",
+            "estimated": False,
+            "badges":    f"{sp.get('game_label','')} · 🤚{sp.get('hand','?')} · {notes}",
             "park":      park,
             "pf":        pf,
-            "pick_pct":  pickpct_dict.get(sp["name"].lower(), 0),
+            "pick_pct":  pickpct_dict.get(key, 0),
         })
 
     # ── BATTERS ───────────────────────────────────────────────────────────────
-    # Use confirmed lineup batters; fall back to board players before lineups post.
-    batter_source = batters if lineups_posted else []
-
-    # If lineups posted, only use confirmed batters.
-    # If not yet posted, walk the board and add any non-pitcher players found
-    # via MLB people search (positional players only).
-    if not lineups_posted:
-        for row in board_rows:
-            key = row["name"].lower()
-            if key in seen_names: continue
-            # Skip players who are today's SPs
-            if any(s["name"].lower() == key for s in starters): continue
-            # We'll add them below with team/park from board context
-            batter_source.append({
-                "mlb_id":       None,    # will look up
-                "name":         row["name"],
-                "pos_code":     "",      # unknown until lookup
-                "team":         "",
-                "batting_order": 5,      # assume middle of order
-                "opp_hand":     "",
-                "park":         "",
-                "game_label":   "",
-                "_from_board":  True,
-                "_price":       row["price"],
-            })
-
-    for p in batter_source:
+    # ctx["batters"] contains both confirmed lineup players AND estimated starters
+    # (from active roster) for teams that haven't posted their lineup yet.
+    # Both are scored identically; the badge shows "~est" for estimated players.
+    for p in batters:
         key = p["name"].lower()
         if key in seen_names: continue
         seen_names.add(key)
         bp = board_dict.get(key)
 
-        # If we don't have MLB ID (pre-lineup board player), look it up
-        mlb_id   = p.get("mlb_id")
+        mlb_id   = p["mlb_id"]
         pos_code = p.get("pos_code","")
         team     = p.get("team","")
 
-        if p.get("_from_board") or not mlb_id:
-            from difflib import SequenceMatcher as SM
-            # Try to find this player in the confirmed batter map first
-            if key in conf_batter_map:
-                info = conf_batter_map[key]
-                mlb_id   = info["mlb_id"]
-                pos_code = info["pos_code"]
-                team     = info["team"]
-            else:
-                # MLB people search — only if not already looked up
-                try:
-                    q = requests.utils.quote(p["name"])
-                    r = requests.get(f"{MLB_API}/people/search?names={q}&sportId=1",
-                                     timeout=8)
-                    r.raise_for_status()
-                    people = r.json().get("people",[])
-                    if not people: continue
-                    px = min(people, key=lambda x: abs(len(x.get("fullName",""))-len(p["name"])))
-                    mlb_id   = px["id"]
-                    pos_code = px.get("primaryPosition",{}).get("abbreviation","")
-                    team     = px.get("currentTeam",{}).get("abbreviation","?")
-                except Exception:
-                    continue
-
-        # Skip pitchers in batter loop
         if pos_code in ("SP","RP","P"): continue
 
-        slots = POS_TO_SLOT.get(pos_code, ["CI"])
-        sal   = (p.get("_price") or salary_lookup(p["name"], sal_dict) or 8.0)
-        sal_ok= salary_lookup(p["name"], sal_dict) is not None
-
-        # Park and matchup context
+        slots      = POS_TO_SLOT.get(pos_code, ["CI"])
+        sal        = salary_lookup(p["name"], sal_dict) or 8.0
+        sal_ok     = salary_lookup(p["name"], sal_dict) is not None
         park       = p.get("park") or park_by_team.get(team, team)
         opp_hand   = p.get("opp_hand") or opp_hand_by_team.get(team,"")
         pf         = PARK_FACTORS.get(park, 1.0)
         game_label = p.get("game_label") or ctx["game_label_by_team"].get(team,"")
-        exp_pa     = {1:LEADOFF_PA,2:LEADOFF_PA}.get(p.get("batting_order",5),
-                      BOTTOM_PA if p.get("batting_order",5)>=7 else DEFAULT_PA)
+        order      = p.get("batting_order", 5)
+        exp_pa     = LEADOFF_PA if order <= 2 else (BOTTOM_PA if order >= 7 else DEFAULT_PA)
 
         s_st  = mlb_season_stats(mlb_id, "hitting")
         sp_st = mlb_split_stats(mlb_id, opp_hand) if opp_hand else {}
         r_st  = mlb_recent_stats(mlb_id, "hitting")
-        # Home/away split: is this batter playing at home today?
-        is_home   = p.get("park") == p.get("team") or park_by_team.get(team,"") == team
-        ha_st     = mlb_home_away_stats(mlb_id, is_home)
-        # Opposing pitcher suppression factor
-        opp_sp    = next((s for s in starters if s.get("opp_team","") == team), None)
-        opp_sup   = mlb_pitcher_suppression(opp_sp["mlb_id"]) if opp_sp else 1.0
-        pts, notes = hitter_pts(s_st, sp_st, r_st, ha_st, exp_pa, pf, sw, rw,
-                                 haw=settings.get("ha_weight", 0.20), opp_sup=opp_sup)
-        pts  = blend_board(pts, bp, bw)
+        is_home = park_by_team.get(team,"") == team
+        ha_st   = mlb_home_away_stats(mlb_id, is_home)
+        opp_sp  = next((s for s in starters if s.get("opp_team","") == team), None)
+        opp_sup = mlb_pitcher_suppression(opp_sp["mlb_id"]) if opp_sp else 1.0
 
-        park_icon  = "🏔" if pf>1.02 else ("🏟" if pf<0.97 else "")
-        hand_badge = f"vs{opp_hand}" if opp_hand else ""
-        order_badge= f"#{p.get('batting_order','')}" if p.get("batting_order") else ""
+        pts, notes = hitter_pts(s_st, sp_st, r_st, ha_st, exp_pa, pf, sw, rw,
+                                haw=settings.get("ha_weight", 0.20), opp_sup=opp_sup)
+        pts = blend_board(pts, bp, bw)
+
+        park_icon   = "🏔" if pf>1.02 else ("🏟" if pf<0.97 else "")
+        hand_badge  = f"vs{opp_hand}" if opp_hand else ""
+        order_badge = f"#{order}" if order else ""
+        est_badge   = " ~est" if p.get("estimated") else ""
 
         pool.append({
             "name":      p["name"],
@@ -667,11 +715,12 @@ def build_pool(board_rows: list[dict], ctx: dict, settings: dict) -> list[dict]:
             "pts":       pts,
             "value":     round(pts/sal, 3) if sal else 0,
             "sal_ok":    sal_ok,
-            "confirmed": p.get("batting_order") is not None and lineups_posted,
-            "badges":    f"{game_label} {park_icon}{park} {hand_badge} {order_badge} · {notes}".strip(),
+            "confirmed": p.get("confirmed", False),
+            "estimated": p.get("estimated", False),
+            "badges":    f"{game_label} {park_icon}{park} {hand_badge} {order_badge}{est_badge} · {notes}".strip(),
             "park":      park,
             "pf":        pf,
-            "pick_pct":  pickpct_dict.get(p["name"].lower(), 0),
+            "pick_pct":  pickpct_dict.get(key, 0),
         })
 
     # ── RELIEF PITCHERS ─────────────────────────────────────────────────────
@@ -726,36 +775,64 @@ def build_pool(board_rows: list[dict], ctx: dict, settings: dict) -> list[dict]:
 
 
 def best_lineup(pool: list, mode: str = "max_pts",
-                contrarian_weight: float = 0.3) -> dict:
+                contrarian_weight: float = 0.3,
+                min_spend: float = 100.0) -> dict:
     """
-    mode="max_pts"    → pure projected-pts optimisation (current behaviour)
-    mode="contrarian" → scores each lineup by pts * (1 / (1 + avg_ownership))
-                        so low-owned players get a relative bonus, helping
-                        you differentiate from the field.
+    Find the best valid Six Picks lineup under the $120 cap.
 
-    contrarian_weight only used in contrarian mode:
-      0.0 = same as max_pts, 1.0 = pure ownership fade
+    min_spend   → require total salary >= this value (default $100).
+                  Forces the optimizer to explore expensive players instead
+                  of finding the cheapest path to the top projected score.
+
+    mode        → "max_pts"    : highest projected points
+                  "contrarian" : adjusts for pick% ownership to differentiate
+                                 from the field (use 0.2–0.4 contrarian_weight)
     """
     def score(combo):
         pts = sum(p["pts"] for p in combo)
         if mode != "contrarian":
             return pts
         avg_own = sum(p.get("pick_pct", 50) for p in combo) / len(combo)
-        # ownership penalty: higher owned → lower score
         return pts * (1.0 - contrarian_weight * (avg_own / 100.0))
 
+    # Consider more candidates per slot so expensive players aren't pruned
     pools = {s: sorted([p for p in pool if s in p["slots"]],
-                        key=lambda p: p["pts"], reverse=True)[:14]
+                        key=lambda p: p["pts"], reverse=True)[:20]
              for s in SLOTS}
-    best = {"pts":-999,"lineup":None,"salary":0,"score":-999}
+
+    best = {"pts": -999, "lineup": None, "salary": 0, "score": -999}
+
     for combo in itertools.product(*[pools[s] for s in SLOTS]):
-        if len({p["name"] for p in combo}) < 6: continue
+        if len({p["name"] for p in combo}) < 6:
+            continue
         sal = sum(p["salary"] for p in combo)
-        if sal > SALARY_CAP: continue
+        if sal > SALARY_CAP:
+            continue        # over cap
+        if sal < min_spend:
+            continue        # under minimum spend floor
         sc = score(combo)
         if sc > best["score"]:
-            best = {"pts":sum(p["pts"] for p in combo),
-                    "lineup":combo,"salary":sal,"score":sc}
+            best = {
+                "pts":    sum(p["pts"] for p in combo),
+                "lineup": combo,
+                "salary": sal,
+                "score":  sc,
+            }
+
+    # If no lineup meets the floor, relax it by $5 increments until one is found
+    if best["lineup"] is None and min_spend > 0:
+        fallback_floor = min_spend - 5.0
+        while fallback_floor >= 0 and best["lineup"] is None:
+            for combo in itertools.product(*[pools[s] for s in SLOTS]):
+                if len({p["name"] for p in combo}) < 6: continue
+                sal = sum(p["salary"] for p in combo)
+                if sal > SALARY_CAP or sal < fallback_floor: continue
+                sc = score(combo)
+                if sc > best["score"]:
+                    best = {"pts":sum(p["pts"] for p in combo),
+                            "lineup":combo,"salary":sal,"score":sc}
+            fallback_floor -= 5.0
+
     return best
 
 # =============================================================================
@@ -789,13 +866,16 @@ def optimal_card(best: dict):
           <span class="opt-pts">{p['pts']:.1f}</span>
         </div>""", unsafe_allow_html=True)
     rem = SALARY_CAP - best["salary"]
+    rem_color = "#e74c3c" if rem > 15 else ("#f39c12" if rem > 8 else "#aaa")
     st.markdown(f"""
     <div style="display:flex;justify-content:space-between;padding:6px 11px;
                 border-top:1px solid #1e3050;font-size:.85rem;margin-top:2px">
       <span>Total <b>${best['salary']:.2f}</b></span>
-      <span>Remaining <b style="color:#aaa">${rem:.2f}</b></span>
+      <span>Remaining <b style="color:{rem_color}">${rem:.2f}</b></span>
       <span>Proj pts <b style="color:#2ecc71">{best['pts']:.1f}</b></span>
     </div>""", unsafe_allow_html=True)
+    if rem > 15:
+        st.warning(f"⚠️ ${rem:.2f} left unspent. Try raising the minimum spend slider.")
 
 # =============================================================================
 #  MAIN
@@ -826,9 +906,19 @@ def main():
             horizontal=True,
             help="Max pts: highest projected score. Contrarian: adjusts for ownership "
                  "to find lineups others aren't picking.")
-        st.caption(f"Season stats · {sw*100:.0f}% platoon · {rw*100:.0f}% L14 · "
-                   f"{haw*100:.0f}% home/away · {bw*100:.0f}% last board · "
-                   f"opp quality + park always on")
+        st.divider()
+        min_spend = st.slider(
+            "Minimum cap spend ($)", 80.0, 119.0, 100.0, 1.0,
+            help="Forces the optimizer to spend at least this much of the $120 cap. "
+                 "Higher = roster pricier players. $100–$115 is a good range. "
+                 "If no valid lineup is found the floor is automatically relaxed."
+        )
+        spend_pct = min_spend / SALARY_CAP * 100
+        st.caption(
+            f"Season stats · {sw*100:.0f}% platoon · {rw*100:.0f}% L14 · "
+            f"{haw*100:.0f}% home/away · {bw*100:.0f}% last board · "
+            f"opp quality + park always on · min spend ${min_spend:.0f} ({spend_pct:.0f}% of cap)"
+        )
 
     if st.button("🔄 Refresh all data", use_container_width=True):
         st.cache_data.clear()
@@ -850,20 +940,48 @@ def main():
     ctx            = build_game_context(games)
     starters       = ctx["starters"]
     batters        = ctx["batters"]
-    lineups_posted = len(batters) > 0
+    lineup_status  = ctx.get("lineup_status", {})
+    n_conf_teams   = sum(1 for v in lineup_status.values() if v == "confirmed")
+    n_est_teams    = sum(1 for v in lineup_status.values() if v == "estimated")
 
     # Summary bar
     c1,c2,c3,c4 = st.columns(4)
-    c1.metric("Games today",  len(games))
-    c2.metric("Conf. SPs",    len(starters))
-    c3.metric("Board players",len(board_rows))
-    c4.metric("Lineups",      "✅ Posted" if lineups_posted else "⏳ Pending")
+    c1.metric("Games today",   len(games))
+    c2.metric("Conf. SPs",     len(starters))
+    c3.metric("Board players", len(board_rows))
+    c4.metric("Lineups", f"✅{n_conf_teams} / ~{n_est_teams}")
 
-    if not lineups_posted:
-        st.warning("⏳ Lineups not yet posted. SP data is ready; batter projections "
-                   "use board players. Re-run ~1hr before first pitch for full accuracy.")
+    # Status message
+    if n_est_teams == 0:
+        st.success(f"✅ All {n_conf_teams} teams confirmed · {sum(1 for p in pool if False) or ''} "
+                   f"Full slate ready.")
+    elif n_conf_teams == 0:
+        st.warning(
+            f"⏳ No lineups posted yet — all {n_est_teams} teams using estimated starters "
+            f"(active roster ranked by PA). Re-run closer to first pitch."
+        )
     else:
-        st.success(f"✅ {len(batters)} confirmed batters loaded with platoon + park adjustments")
+        st.info(
+            f"✅ {n_conf_teams} team(s) confirmed  ·  "
+            f"〜 {n_est_teams} team(s) estimated from active roster  ·  "
+            f"Refresh closer to first pitch to fill in remaining lineups"
+        )
+
+    # Per-team lineup status table
+    if lineup_status:
+        with st.expander("📋 Lineup status by team", expanded=(n_est_teams > 0)):
+            conf_teams = sorted([t for t,s in lineup_status.items() if s=="confirmed"])
+            est_teams  = sorted([t for t,s in lineup_status.items() if s=="estimated"])
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.markdown("**✅ Confirmed**")
+                for t in conf_teams:
+                    st.caption(t)
+            with col_b:
+                st.markdown("**〜 Estimated (active roster)**")
+                for t in est_teams:
+                    st.caption(f"{t} — using top-PA regulars")
+
 
     # Today's SP summary
     with st.expander(f"🔥 Today's confirmed starters ({len(starters)})", expanded=True):
@@ -910,7 +1028,8 @@ def main():
     with st.spinner("Optimizing…"):
         best = best_lineup(pool,
                            mode="contrarian" if opt_mode=="Contrarian" else "max_pts",
-                           contrarian_weight=cw)
+                           contrarian_weight=cw,
+                           min_spend=min_spend)
     if opt_mode == "Contrarian":
         st.info(f"🎲 Contrarian mode: ownership weight {cw*100:.0f}% · "
                 f"lower-owned players receive a scoring bonus")
